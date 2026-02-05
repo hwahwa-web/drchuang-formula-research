@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>方劑組成搜尋（試用版）</title>
+  <style>
+    body { font-family: system-ui, -apple-system, "Noto Sans TC", Arial; margin: 24px; line-height: 1.5; }
+    textarea, input { box-sizing: border-box; }
+    textarea { width: 100%; min-height: 110px; padding: 12px; font-size: 16px; }
+    button { padding: 10px 14px; font-size: 16px; cursor: pointer; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .muted { color: #666; font-size: 14px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px 14px; margin-top: 14px; }
+    .tag { display: inline-block; padding: 2px 8px; border: 1px solid #ddd; border-radius: 999px; margin: 2px 6px 2px 0; font-size: 13px; }
+    .good { border-color: #8fd19e; background: #f1fff5; }
+    .warn { border-color: #ffd28a; background: #fff9ef; }
+    .bad  { border-color: #ff9f9f; background: #fff3f3; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }
+    .grid2 { display:grid; grid-template-columns: 1fr; gap: 12px; }
+    @media (min-width: 980px){ .grid2 { grid-template-columns: 1fr 1fr; } }
+    .pill { display:inline-flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #ddd; border-radius:999px; }
+    .small { font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>方劑組成搜尋（試用版）</h1>
+  <p class="muted">
+    功能：① 藥味比對找最符合方 ② 方名關鍵字搜尋 ③ 合方判斷（最多兩方）
+  </p>
+
+  <div class="grid2">
+    <div class="card">
+      <div style="font-weight:800; margin-bottom:8px;">A) 藥味輸入 → 找最符合方 / 合方</div>
+      <textarea id="input" placeholder="例：桂枝、芍藥、甘草、大棗、生薑、葛根、大黃"></textarea>
+
+      <div class="row" style="margin-top: 10px;">
+        <button id="searchBtn">搜尋</button>
+
+        <span class="pill muted small">
+          顯示前
+          <input id="topN" type="number" min="1" max="50" value="10" style="width:70px; padding:6px;" />
+          筆
+        </span>
+
+        <span class="pill muted small">
+          最低覆蓋率
+          <input id="minCoverage" type="number" min="0" max="1" step="0.05" value="0.4" style="width:80px; padding:6px;" />
+          （0~1）
+        </span>
+
+        <span class="pill muted small">
+          <input id="enableCombo" type="checkbox" checked />
+          啟用合方
+        </span>
+
+        <span class="pill muted small">
+          合方候選方數
+          <input id="comboCandidates" type="number" min="20" max="500" value="120" style="width:90px; padding:6px;" />
+        </span>
+      </div>
+
+      <div id="status" class="muted" style="margin-top: 10px;"></div>
+      <div id="results"></div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:800; margin-bottom:8px;">B) 方名關鍵字搜尋（輸入字就能找）</div>
+      <input id="nameQuery" type="text" placeholder="輸入方名關鍵字，例如：桂枝 / 承氣 / 逍遙"
+             style="width:100%; padding:10px; font-size:16px;" />
+      <div class="muted" style="margin-top:6px;">
+        會列出匹配方名；點一下可將該方藥味帶入左側輸入框並自動搜尋。
+      </div>
+      <div id="nameResults"></div>
+    </div>
+  </div>
+
+<script>
+  // =========================
+  // Cache
+  // =========================
+  let FORMULAS_CACHE = [];
+  let FORMULAS_LOADED = false;
+
+  // =========================
+  // Normalization & parsing
+  // =========================
+  function normalizeHerb(s) {
+    return (s || "")
+      .trim()
+      .replace(/[，、；;]+/g, ",")
+      .replace(/\s+/g, "");
+  }
+
+  function parseHerbList(text) {
+    const raw = (text || "")
+      .replace(/[，、；;]+/g, ",")
+      .replace(/\n+/g, ",")
+      .split(",")
+      .map(normalizeHerb)
+      .filter(Boolean);
+
+    const seen = new Set();
+    const out = [];
+    for (const h of raw) {
+      if (!seen.has(h)) { seen.add(h); out.push(h); }
+    }
+    return out;
+  }
+
+  // 兼容兩種資料格式：
+  // A) {name, herbs:["桂枝","芍藥"...]}
+  // B) {name, items:[{herb:"桂枝", dose:0.5}...]}
+  function getHerbList(formula) {
+    if (Array.isArray(formula.herbs)) return formula.herbs.map(normalizeHerb).filter(Boolean);
+    if (Array.isArray(formula.items)) return formula.items.map(x => normalizeHerb(x.herb)).filter(Boolean);
+    return [];
+  }
+
+  async function loadFormulas() {
+    if (FORMULAS_LOADED) return FORMULAS_CACHE;
+
+    const res = await fetch("./formulas.json", { cache: "no-store" });
+    if (!res.ok) throw new Error("無法讀取 formulas.json（請確認檔案存在且與 index.html 同層）");
+    const data = await res.json();
+
+    const formulas = data.map(x => ({
+      name: x.name || x.組套 || x.title || "（未命名）",
+      herbs: getHerbList(x)
+    })).filter(x => x.name && x.herbs.length);
+
+    FORMULAS_CACHE = formulas;
+    FORMULAS_LOADED = true;
+    return FORMULAS_CACHE;
+  }
+
+  // =========================
+  // Scoring
+  // =========================
+  // coverage = matched / formula_size
+  // precision = matched / input_size
+  // score = coverage*0.75 + precision*0.25 (偏重方內覆蓋)
+  function scoreFormula(inputSet, formulaHerbs) {
+    const fSet = new Set(formulaHerbs);
+    let matched = 0;
+    for (const h of inputSet) if (fSet.has(h)) matched++;
+
+    const coverage = formulaHerbs.length ? matched / formulaHerbs.length : 0;
+    const precision = inputSet.size ? matched / inputSet.size : 0;
+    const score = coverage * 0.75 + precision * 0.25;
+
+    const missing = formulaHerbs.filter(h => !inputSet.has(h));
+    const extras = [...inputSet].filter(h => !fSet.has(h));
+
+    return { matched, coverage, precision, score, missing, extras };
+  }
+
+  // 合方（兩方 union）
+  // score = precision*0.65 + coverage*0.35 (偏重把你的輸入解釋掉)
+  function scoreCombo(inputSet, herbsA, herbsB) {
+    const union = new Set([...herbsA, ...herbsB]);
+    let matched = 0;
+    for (const h of inputSet) if (union.has(h)) matched++;
+
+    const unionList = [...union];
+    const coverage = unionList.length ? matched / unionList.length : 0;
+    const precision = inputSet.size ? matched / inputSet.size : 0;
+    const score = precision * 0.65 + coverage * 0.35;
+
+    const missing = unionList.filter(h => !inputSet.has(h));
+    const extras = [...inputSet].filter(h => !union.has(h));
+
+    return { matched, coverage, precision, score, missing, extras, unionList };
+  }
+
+  function badgeClass(coverage) {
+    if (coverage >= 0.8) return "good";
+    if (coverage >= 0.5) return "warn";
+    return "bad";
+  }
+
+  // =========================
+  // Rendering helpers
+  // =========================
+  function escapeHtml(s){
+    return (s||"").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+  }
+
+  function renderTags(list) {
+    if (!list.length) return `<span class="muted">（無）</span>`;
+    return list.map(x => `<span class="tag">${escapeHtml(x)}</span>`).join("");
+  }
+
+  function renderResult(item) {
+    const { formula, stat } = item;
+    const pct = (v) => (Math.round(v * 1000) / 10).toFixed(1) + "%";
+
+    const addOn = stat.extras.length ? ` + ${stat.extras.join("、")}` : "";
+    const title = `${formula.name}${addOn}`;
+
+    return `
+      <div class="card ${badgeClass(stat.coverage)}">
+        <div style="font-size:18px; font-weight:700;">${escapeHtml(title)}</div>
+        <div class="muted mono" style="margin-top:6px;">
+          覆蓋率(方內命中)：${pct(stat.coverage)}　
+          精準率(輸入命中)：${pct(stat.precision)}　
+          綜合分數：${(Math.round(stat.score*1000)/10).toFixed(1)}
+        </div>
+
+        <div style="margin-top:10px;">
+          <div><b>方劑組成</b>：${renderTags(formula.herbs)}</div>
+          <div style="margin-top:6px;"><b>你輸入的加味（多出）</b>：${renderTags(stat.extras)}</div>
+          <div style="margin-top:6px;"><b>你缺少的方內藥味</b>：${renderTags(stat.missing)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  function highlight(text, q){
+    if (!q) return escapeHtml(text);
+    const idx = text.toLowerCase().indexOf(q.toLowerCase());
+    if (idx < 0) return escapeHtml(text);
+    const a = escapeHtml(text.slice(0, idx));
+    const b = escapeHtml(text.slice(idx, idx + q.length));
+    const c = escapeHtml(text.slice(idx + q.length));
+    return `${a}<span style="background:#fff2a8; padding:0 2px; border-radius:4px;">${b}</span>${c}`;
+  }
+
+  // =========================
+  // Feature 1: Herb-based search + combo
+  // =========================
+  async function runSearch() {
+    const statusEl = document.getElementById("status");
+    const resultsEl = document.getElementById("results");
+    resultsEl.innerHTML = "";
+    statusEl.textContent = "讀取方劑資料中…";
+
+    const inputHerbs = parseHerbList(document.getElementById("input").value);
+    const inputSet = new Set(inputHerbs);
+
+    if (inputSet.size === 0) {
+      statusEl.textContent = "請先輸入至少 1 味藥。";
+      return;
+    }
+
+    let formulas;
+    try {
+      formulas = await loadFormulas();
+    } catch (e) {
+      statusEl.textContent = e.message;
+      return;
+    }
+
+    const topN = Math.max(1, Math.min(50, Number(document.getElementById("topN").value || 10)));
+    const minCoverage = Math.max(0, Math.min(1, Number(document.getElementById("minCoverage").value || 0)));
+    const enableCombo = document.getElementById("enableCombo").checked;
+
+    const scored = formulas.map(f => {
+      const stat = scoreFormula(inputSet, f.herbs);
+      return { formula: f, stat };
+    }).filter(x => x.stat.coverage >= minCoverage);
+
+    scored.sort((a,b) => b.stat.score - a.stat.score || b.stat.coverage - a.stat.coverage);
+
+    statusEl.textContent =
+      `輸入藥味：${inputHerbs.join("、")} ｜ 共比對 ${formulas.length} 方 ｜ 顯示 ${Math.min(topN, scored.length)} 筆`;
+
+    // --- 合方判斷（最多兩方） ---
+    let comboHtml = "";
+    if (enableCombo && scored.length >= 2) {
+      const candidatesN = Math.max(20, Math.min(500, Number(document.getElementById("comboCandidates").value || 120)));
+      const candidates = scored.slice(0, candidatesN);
+
+      let best = null;
+      for (let i = 0; i < candidates.length; i++) {
+        for (let j = i + 1; j < candidates.length; j++) {
+          const A = candidates[i].formula;
+          const B = candidates[j].formula;
+
+          const stat = scoreCombo(inputSet, A.herbs, B.herbs);
+
+          // 合方必須顯著提升「輸入命中」（precision）才推薦
+          const bestSingle = scored[0].stat;
+          const precisionGain = stat.precision - bestSingle.precision;
+          if (precisionGain < 0.08) continue; // 門檻：至少提升 8%
+
+          const candidate = { A, B, stat };
+          if (!best || candidate.stat.score > best.stat.score) best = candidate;
+        }
+      }
+
+      const pct = (v) => (Math.round(v * 1000) / 10).toFixed(1) + "%";
+      if (best) {
+        const title = `${best.A.name} 合 ${best.B.name}` + (best.stat.extras.length ? ` + ${best.stat.extras.join("、")}` : "");
+        comboHtml = `
+          <div class="card good">
+            <div style="font-size:18px; font-weight:800;">🔥 推薦合方：${escapeHtml(title)}</div>
+            <div class="muted mono" style="margin-top:6px;">
+              覆蓋率(合方命中)：${pct(best.stat.coverage)}　
+              精準率(輸入命中)：${pct(best.stat.precision)}　
+              綜合分數：${(Math.round(best.stat.score*1000)/10).toFixed(1)}
+            </div>
+            <div style="margin-top:10px;">
+              <div><b>方 A</b>：${renderTags(best.A.herbs)}</div>
+              <div style="margin-top:6px;"><b>方 B</b>：${renderTags(best.B.herbs)}</div>
+              <div style="margin-top:8px;"><b>合方缺少的藥味</b>：${renderTags(best.stat.missing)}</div>
+              <div style="margin-top:6px;"><b>你的加味（多出）</b>：${renderTags(best.stat.extras)}</div>
+            </div>
+          </div>
+        `;
+      } else {
+        comboHtml = `
+          <div class="card warn">
+            <div style="font-weight:700;">合方判斷：暫時沒有找到「明顯優於單方」的兩方組合</div>
+            <div class="muted" style="margin-top:6px;">
+              可嘗試：提高「合方候選方數」、降低「最低覆蓋率」、或輸入更完整藥味。
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    resultsEl.innerHTML = comboHtml + (scored.slice(0, topN).map(renderResult).join("")
+      || `<div class="card">沒有符合最低覆蓋率（${minCoverage}）的結果，請降低門檻或增加方劑資料。</div>`);
+  }
+
+  // =========================
+  // Feature 2: Name keyword search
+  // =========================
+  async function runNameSearch() {
+    const box = document.getElementById("nameResults");
+    const q = (document.getElementById("nameQuery").value || "").trim();
+    box.innerHTML = "";
+
+    if (!q) return;
+
+    let formulas;
+    try {
+      formulas = await loadFormulas();
+    } catch (e) {
+      box.innerHTML = `<div class="card bad">${escapeHtml(e.message)}</div>`;
+      return;
+    }
+
+    const hits = formulas
+      .filter(f => f.name.toLowerCase().includes(q.toLowerCase()))
+      .slice(0, 30);
+
+    if (!hits.length) {
+      box.innerHTML = `<div class="muted">找不到包含「${escapeHtml(q)}」的方名。</div>`;
+      return;
+    }
+
+    box.innerHTML = hits.map(f => `
+      <div class="card" style="margin-top:8px; cursor:pointer;" data-name="${escapeHtml(f.name)}">
+        <div style="font-weight:700;">${highlight(f.name, q)}</div>
+        <div class="muted" style="margin-top:6px;">${f.herbs.map(h => `<span class="tag">${escapeHtml(h)}</span>`).join("")}</div>
+      </div>
+    `).join("");
+
+    box.querySelectorAll("[data-name]").forEach(el => {
+      el.addEventListener("click", async () => {
+        const name = el.getAttribute("data-name");
+        const found = formulas.find(x => x.name === name);
+        if (!found) return;
+        document.getElementById("input").value = found.herbs.join("、");
+        await runSearch();
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      });
+    });
+  }
+
+  // =========================
+  // Events
+  // =========================
+  document.getElementById("searchBtn").addEventListener("click", runSearch);
+  document.getElementById("nameQuery").addEventListener("input", runNameSearch);
+
+  // optional: preload formulas quietly
+  loadFormulas().catch(()=>{});
+</script>
+
+</body>
+</html>
